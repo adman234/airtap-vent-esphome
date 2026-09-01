@@ -1,0 +1,17 @@
+# Guest room AirTap vent.
+#
+# TODO before first flash: set `name` and `device_address` to match this unit.
+# `device_address` must be whatever the device answers on RIGHT NOW — after the
+# rename flash lands, update it to <name>-<mac suffix>.local.
+
+substitutions:
+  name: "airtap-guest"
+  friendly_name: "AirTap Vent Guest"
+  device_address: "airtap-guest.local"
+  room_temp_entity: "sensor.temp_sensor_guest_room_temperature"
+  thermostat_entity: "climate.thermy_mcthermostat"
+  default_speed: "4"
+  log_level: "INFO"
+
+packages:
+  vent: !include packages/airtap-vent.yaml

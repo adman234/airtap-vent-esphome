@@ -1,0 +1,649 @@
+# AirTap T-Series vent controller — shared package
+# XIAO ESP32-C6 + SSD1306 OLED + 4 panel buttons + NTC vent probe + PWM fan.
+#
+# Include this from a per-device file that supplies the substitutions below.
+# See ../airtap-office.yaml for an example.
+#
+# CONTROL MODEL
+#   The device owns the decision. Home Assistant supplies room temperature and
+#   thermostat setpoints over the native API; everything else is computed here so
+#   the vent keeps working (on its last known inputs) if HA restarts.
+#
+#   AUTO demand is true when the HVAC is actively moving air AND boosting this
+#   register would help:
+#       room > cool_setpoint  AND  vent < (room - buffer)     -> cooling assist
+#       room < heat_setpoint  AND  vent > (room + buffer)     -> heating assist
+#
+# RESTING STATE
+#   Every boot lands in AUTO at the configured default speed. Only a panel button
+#   or a person in HA drops the device to MANUAL. Nothing else does — see the
+#   `booting` and `auto_applying` guards on the fan triggers.
+#
+# UNITS
+#   Everything compared is °F. The NTC calibration is in °C (correct physics) and
+#   the sensor output is converted to °F to match the HA room sensor and setpoints.
+
+substitutions:
+  log_level: "INFO"
+  # Per-device files must override these:
+  name: "airtap-vent"
+  friendly_name: "AirTap Vent"
+  device_address: "airtap-vent.local"
+  room_temp_entity: "sensor.room_temperature"
+  thermostat_entity: "climate.thermostat"
+  # Resting state: AUTO at this speed (1-10). 4 = 40%.
+  default_speed: "4"
+
+esphome:
+  name: "${name}"
+  friendly_name: "${friendly_name}"
+  name_add_mac_suffix: true
+  min_version: 2025.6.0
+  project:
+    name: silocitylabs.airtap-esp32-4btn-rev2
+    version: "2.0.0"
+  on_boot:
+    # Late priority: displays, globals and the fan are all set up by now.
+    - priority: -100
+      then:
+        - lambda: |-
+            id(display_1306).set_contrast(id(oled_brightness) / 100.0);
+        # Release the boot guard only after restore has finished firing its
+        # callbacks, so a restored fan state can never flip us into MANUAL.
+        - delay: 2s
+        - lambda: 'id(booting) = false;'
+        - script.execute: apply_auto
+
+esp32:
+  board: seeed_xiao_esp32c6
+  framework:
+    type: esp-idf          # required for the C6
+
+logger:
+  level: "${log_level}"
+
+api:
+  encryption:
+    key: !secret airtap_api_key
+
+ota:
+  - platform: esphome
+    id: airtap_ota
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  id: wifi_comp
+  reboot_timeout: 10min
+  # BLE (esp32_improv) is deliberately NOT enabled on this build. The C6 has a
+  # single 2.4 GHz radio shared by WiFi and BLE, so dropping BLE frees the radio
+  # and lets us disable modem sleep for a much more responsive native API — which
+  # matters here, because the auto logic is fed by HA-imported sensors.
+  power_save_mode: NONE
+  # Point this at the address the device answers on RIGHT NOW. After a rename
+  # flash lands, update it to the new name.
+  use_address: ${device_address}
+  ap:
+    ssid: "${friendly_name} Hotspot"
+    password: !secret ap_password
+
+captive_portal:
+
+web_server:
+  port: 80
+  local: true
+  auth:
+    username: admin
+    password: !secret web_password
+
+# Serial provisioning only — no BLE. Costs nothing, it is just UART.
+improv_serial:
+
+i2c:
+  id: airtap_i2c
+  sda: GPIO22
+  scl: GPIO23
+  scan: true
+  frequency: 400kHz
+
+globals:
+  # --- Mode. Deliberately NOT restored: every boot returns to AUTO. ---
+  - id: auto_mode
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+
+  # --- Resting speed. Also not restored: every boot returns to the default. ---
+  - id: auto_speed
+    type: int
+    restore_value: no
+    initial_value: '${default_speed}'
+
+  # --- Guards ---
+  - id: auto_applying
+    type: bool
+    restore_value: no
+    initial_value: 'false'     # true while the auto logic is driving the fan
+  - id: booting
+    type: bool
+    restore_value: no
+    initial_value: 'true'      # true until on_boot completes
+
+  # --- Tuning. Restored, because only a person ever changes these. ---
+  - id: auto_buffer
+    type: float
+    restore_value: yes
+    initial_value: '1.0'       # °F the vent must beat the room by to be worth running
+  - id: room_deadband
+    type: float
+    restore_value: yes
+    initial_value: '0.5'       # °F hysteresis around the thermostat setpoints
+  - id: min_run_seconds
+    type: int
+    restore_value: yes
+    initial_value: '180'       # anti short-cycle: minimum time on
+  - id: min_off_seconds
+    type: int
+    restore_value: yes
+    initial_value: '120'       # anti short-cycle: minimum time off
+  - id: require_hvac_active
+    type: bool
+    restore_value: yes
+    initial_value: 'true'      # only boost while the thermostat is heating/cooling
+  - id: panel_disabled
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  - id: oled_brightness
+    type: float
+    restore_value: yes
+    initial_value: '100.0'
+
+  # --- Anti short-cycle bookkeeping ---
+  - id: last_fan_change_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+script:
+  # Single place that drives the fan from the auto decision.
+  # `auto_applying` suppresses the fan's manual-override triggers so an
+  # auto-driven change is never mistaken for a user action.
+  - id: apply_auto
+    mode: single
+    then:
+      - lambda: |-
+          if (!id(auto_mode) || id(booting)) return;
+
+          const bool demand  = id(auto_demand).state;
+          const bool running = id(airtap_fan).state;
+          const uint32_t now = millis();
+
+          // Already in the right on/off state: only correct the speed.
+          if (demand == running) {
+            if (running && id(airtap_fan).speed != id(auto_speed)) {
+              id(auto_applying) = true;
+              auto call = id(airtap_fan).turn_on();
+              call.set_speed(id(auto_speed));
+              call.perform();
+              id(auto_applying) = false;
+            }
+            return;
+          }
+
+          // A state change is wanted — enforce the anti short-cycle hold.
+          // last_fan_change_ms == 0 means we have not switched yet this boot.
+          const uint32_t hold_ms =
+              (uint32_t)(running ? id(min_run_seconds) : id(min_off_seconds)) * 1000UL;
+          if (id(last_fan_change_ms) != 0 && (now - id(last_fan_change_ms)) < hold_ms) {
+            return;   // the periodic interval will retry once the hold expires
+          }
+
+          id(auto_applying) = true;
+          if (demand) {
+            auto call = id(airtap_fan).turn_on();
+            call.set_speed(id(auto_speed));
+            call.perform();
+          } else {
+            id(airtap_fan).turn_off().perform();
+          }
+          id(auto_applying) = false;
+          id(last_fan_change_ms) = now;
+
+  # Return to the resting state: AUTO at the default speed.
+  - id: reset_to_default
+    then:
+      - lambda: |-
+          id(auto_mode)  = true;
+          id(auto_speed) = ${default_speed};
+          id(auto_switch).publish_state(true);
+          id(auto_speed_number).publish_state(${default_speed});
+      - script.execute: apply_auto
+
+switch:
+  - platform: template
+    name: "Auto Mode"
+    id: auto_switch
+    icon: mdi:thermostat-auto
+    restore_mode: DISABLED       # state follows the auto_mode global
+    lambda: 'return id(auto_mode);'
+    turn_on_action:
+      - lambda: 'id(auto_mode) = true; id(auto_switch).publish_state(true);'
+      - script.execute: apply_auto
+    turn_off_action:
+      - lambda: 'id(auto_mode) = false; id(auto_switch).publish_state(false);'
+
+  - platform: template
+    name: "Require HVAC Active"
+    id: require_hvac_switch
+    icon: mdi:hvac
+    entity_category: config
+    restore_mode: DISABLED
+    lambda: 'return id(require_hvac_active);'
+    turn_on_action:
+      - lambda: 'id(require_hvac_active) = true; id(require_hvac_switch).publish_state(true);'
+    turn_off_action:
+      - lambda: 'id(require_hvac_active) = false; id(require_hvac_switch).publish_state(false);'
+
+  - platform: template
+    name: "Disable Panel Buttons"
+    id: panel_disable_switch
+    icon: mdi:lock
+    entity_category: config
+    restore_mode: DISABLED
+    lambda: 'return id(panel_disabled);'
+    turn_on_action:
+      - lambda: 'id(panel_disabled) = true; id(panel_disable_switch).publish_state(true);'
+    turn_off_action:
+      - lambda: 'id(panel_disabled) = false; id(panel_disable_switch).publish_state(false);'
+
+button:
+  - platform: restart
+    id: restart_button
+    icon: mdi:power-cycle
+    name: "ESP Reboot"
+
+  - platform: template
+    name: "Reset To Auto Default"
+    id: reset_button
+    icon: mdi:restore
+    on_press:
+      - script.execute: reset_to_default
+
+number:
+  - platform: template
+    name: "Auto Fan Speed"
+    id: auto_speed_number
+    icon: mdi:fan
+    min_value: 1
+    max_value: 10
+    step: 1
+    mode: slider
+    entity_category: config
+    lambda: 'return id(auto_speed);'
+    set_action:
+      - lambda: 'id(auto_speed) = (int)(x); id(auto_speed_number).publish_state(x);'
+      - script.execute: apply_auto
+
+  - platform: template
+    name: "Auto Buffer"
+    id: auto_buffer_number
+    icon: mdi:plus-minus-variant
+    unit_of_measurement: "°F"
+    min_value: 0
+    max_value: 5
+    step: 0.5
+    mode: box
+    entity_category: config
+    lambda: 'return id(auto_buffer);'
+    set_action:
+      - lambda: 'id(auto_buffer) = x; id(auto_buffer_number).publish_state(x);'
+
+  - platform: template
+    name: "Room Deadband"
+    id: room_deadband_number
+    icon: mdi:arrow-expand-vertical
+    unit_of_measurement: "°F"
+    min_value: 0
+    max_value: 3
+    step: 0.25
+    mode: box
+    entity_category: config
+    lambda: 'return id(room_deadband);'
+    set_action:
+      - lambda: 'id(room_deadband) = x; id(room_deadband_number).publish_state(x);'
+
+  - platform: template
+    name: "Min Run Time"
+    id: min_run_number
+    icon: mdi:timer-play
+    unit_of_measurement: "s"
+    min_value: 0
+    max_value: 900
+    step: 30
+    mode: box
+    entity_category: config
+    lambda: 'return id(min_run_seconds);'
+    set_action:
+      - lambda: 'id(min_run_seconds) = (int)(x); id(min_run_number).publish_state(x);'
+
+  - platform: template
+    name: "Min Off Time"
+    id: min_off_number
+    icon: mdi:timer-off
+    unit_of_measurement: "s"
+    min_value: 0
+    max_value: 900
+    step: 30
+    mode: box
+    entity_category: config
+    lambda: 'return id(min_off_seconds);'
+    set_action:
+      - lambda: 'id(min_off_seconds) = (int)(x); id(min_off_number).publish_state(x);'
+
+  - platform: template
+    name: "OLED Brightness"
+    id: oled_brightness_number
+    icon: mdi:brightness-6
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 5
+    mode: slider
+    entity_category: config
+    lambda: 'return id(oled_brightness);'
+    set_action:
+      - lambda: |-
+          id(oled_brightness) = x;
+          id(oled_brightness_number).publish_state(x);
+          id(display_1306).set_contrast(x / 100.0);
+
+sensor:
+  # --- Inputs imported from Home Assistant ---
+  # These deliberately have no on_value triggers. Changing an input changes
+  # `auto_demand`, and auto_demand's on_state is the single entry point into
+  # apply_auto. That avoids acting on a demand value computed from the previous
+  # inputs, which is what happens if every input calls apply_auto directly.
+  - platform: homeassistant
+    id: room_temp
+    entity_id: ${room_temp_entity}
+    internal: true
+
+  - platform: homeassistant
+    id: cool_setpoint
+    entity_id: ${thermostat_entity}
+    attribute: target_temp_high
+    internal: true
+
+  - platform: homeassistant
+    id: heat_setpoint
+    entity_id: ${thermostat_entity}
+    attribute: target_temp_low
+    internal: true
+
+  # --- On-device vent temperature (NTC probe), output in °F ---
+  - platform: adc
+    pin: GPIO2
+    id: adc_sensor
+    attenuation: 12db
+    update_interval: 10s
+    filters:
+      - median:
+          window_size: 5
+          send_every: 1
+
+  - platform: resistance
+    id: temp_resistance_reading
+    sensor: adc_sensor
+    configuration: DOWNSTREAM
+    resistor: 10kOhm
+
+  - platform: ntc
+    sensor: temp_resistance_reading
+    # Calibration in °C (correct physics); output converted to °F below.
+    calibration:
+      - 3.389kOhm -> 0°C
+      - 10.0kOhm -> 25°C
+      - 27.219kOhm -> 50°C
+    filters:
+      - lambda: return x * (9.0 / 5.0) + 32.0;   # °C -> °F
+    name: "Vent Temperature"
+    id: temp_sensor
+    unit_of_measurement: "°F"
+    accuracy_decimals: 1
+    icon: "mdi:thermometer"
+
+  - platform: wifi_signal
+    id: esp_wifi_signal
+    name: "WiFi Signal"
+    entity_category: diagnostic
+    update_interval: 60s
+
+text_sensor:
+  # What the thermostat is actually doing right now. Boosting a register while
+  # the system is idle just pushes stale duct air around, so gate on this.
+  - platform: homeassistant
+    id: hvac_action
+    entity_id: ${thermostat_entity}
+    attribute: hvac_action
+    internal: true
+
+binary_sensor:
+  # --- The auto decision. Single source of truth. ---
+  # TemplateBinarySensor re-evaluates in loop(), so this tracks its inputs
+  # continuously and on_state fires the moment the decision actually flips.
+  - platform: template
+    name: "Auto Fan Demand"
+    id: auto_demand
+    icon: "mdi:fan-auto"
+    lambda: |-
+      const float room    = id(room_temp).state;
+      const float cool_sp = id(cool_setpoint).state;
+      const float heat_sp = id(heat_setpoint).state;
+      const float vent    = id(temp_sensor).state;   // already °F
+      const float buf     = id(auto_buffer);
+
+      if (isnan(room) || isnan(vent) || isnan(cool_sp) || isnan(heat_sp)) {
+        return false;                                // missing data -> no demand
+      }
+
+      // Only assist while the system is actually moving conditioned air.
+      // An empty string means HA has not reported the attribute yet, in which
+      // case fall through to the temperature test rather than blocking forever.
+      if (id(require_hvac_active)) {
+        const std::string act = id(hvac_action).state;
+        if (!act.empty() && act != "heating" && act != "cooling") {
+          return false;
+        }
+      }
+
+      // Hysteresis on the room-vs-setpoint test: harder to start than to keep
+      // running, so the fan does not chatter while the room sits on setpoint.
+      const float margin = id(auto_demand).state ? -id(room_deadband) : id(room_deadband);
+
+      if (room > cool_sp + margin && vent < (room - buf)) return true;   // cooling assist
+      if (room < heat_sp - margin && vent > (room + buf)) return true;   // heating assist
+      return false;
+    on_state:
+      then:
+        - script.execute: apply_auto
+
+  # --- Physical panel buttons: Power, Mode, Up, Down ---
+  # All debounced: contact bounce on the Mode button would otherwise toggle AUTO
+  # more than once per press, which looks exactly like the device "changing mode
+  # on its own".
+  - platform: gpio
+    pin:
+      number: GPIO20
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    name: "Power Button"
+    id: button_power
+    internal: true
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 20ms
+    on_press:
+      then:
+        - lambda: |-
+            if (!id(panel_disabled)) {
+              id(auto_mode) = false;            // power press -> manual
+              id(auto_switch).publish_state(false);
+              id(airtap_fan).toggle().perform();
+            }
+
+  - platform: gpio
+    pin:
+      number: GPIO17
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    name: "Up Button"
+    id: button_up
+    internal: true
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 20ms
+    on_press:
+      then:
+        - lambda: |-
+            if (!id(panel_disabled)) {
+              id(auto_mode) = false;            // panel press -> manual
+              id(auto_switch).publish_state(false);
+              int s = id(airtap_fan).state ? id(airtap_fan).speed : 0;
+              if (s < 10) {
+                auto call = id(airtap_fan).turn_on();
+                call.set_speed(s + 1);
+                call.perform();
+              }
+            }
+
+  - platform: gpio
+    pin:
+      number: GPIO19
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    name: "Down Button"
+    id: button_down
+    internal: true
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 20ms
+    on_press:
+      then:
+        - lambda: |-
+            if (!id(panel_disabled)) {
+              id(auto_mode) = false;            // panel press -> manual
+              id(auto_switch).publish_state(false);
+              int s = id(airtap_fan).state ? id(airtap_fan).speed : 0;
+              if (s > 1) {
+                auto call = id(airtap_fan).turn_on();
+                call.set_speed(s - 1);
+                call.perform();
+              } else {
+                id(airtap_fan).turn_off().perform();
+              }
+            }
+
+  - platform: gpio
+    pin:
+      number: GPIO18
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    name: "Mode Button"
+    id: button_mode
+    internal: true
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 20ms
+    on_press:
+      then:
+        - lambda: |-
+            if (!id(panel_disabled)) {
+              id(auto_mode) = !id(auto_mode);   // toggle AUTO <-> MANUAL
+              id(auto_switch).publish_state(id(auto_mode));
+            }
+        - script.execute: apply_auto   # if we just re-entered auto, act now
+
+output:
+  - platform: ledc
+    pin:
+      number: GPIO0
+    id: pwm_output_1
+    frequency: 1000 Hz
+
+  # Maps the speed fan's 0.0-1.0 level onto the fan's PWM start curve.
+  - platform: template
+    id: fan_curve_output
+    type: float
+    write_action:
+      - lambda: |-
+          int speed = (int) lroundf(state * 10.0f);   // 0..10  (state = 0.0-1.0)
+          float duty;
+          if (speed <= 0)      duty = 0.0f;
+          else if (speed == 1) duty = 0.38f;       // min duty to start the fan
+          else                 duty = (speed + 4) / 14.0f;
+          id(pwm_output_1).set_level(duty);
+
+fan:
+  - platform: speed
+    id: airtap_fan
+    name: "AirTap Fan"
+    output: fan_curve_output
+    speed_count: 10
+    # ALWAYS_OFF, not RESTORE_*. Restoring the previous state fires the fan's
+    # state callbacks during setup(); FanTurnOnTrigger sees off->on and fires
+    # on_turn_on, whose lambda would drop the device into MANUAL on every reboot.
+    # The `booting` guard also covers this, but there is no reason to restore a
+    # state that the auto logic is about to recompute anyway.
+    restore_mode: ALWAYS_OFF
+    # Any on/off NOT issued by the auto logic is a user action -> drop to manual.
+    on_turn_on:
+      - lambda: |-
+          if (!id(auto_applying) && !id(booting)) {
+            id(auto_mode) = false;
+            id(auto_switch).publish_state(false);
+          }
+    on_turn_off:
+      - lambda: |-
+          if (!id(auto_applying) && !id(booting)) {
+            id(auto_mode) = false;
+            id(auto_switch).publish_state(false);
+          }
+
+display:
+  - platform: ssd1306_i2c
+    id: display_1306
+    model: "SSD1306 128x64"
+    address: 0x3C
+    lambda: |-
+      it.printf(0, 0, id(myfont), "AirTap  %s", id(auto_mode) ? "AUTO" : "MANUAL");
+      it.printf(0, 14, id(myfont), "Vent: %.1f°F", id(temp_sensor).state);
+      if (isnan(id(room_temp).state)) {
+        it.printf(0, 28, id(myfont), "Room: --");
+      } else {
+        it.printf(0, 28, id(myfont), "Room: %.1f°F", id(room_temp).state);
+      }
+      int spd = id(airtap_fan).state ? id(airtap_fan).speed : 0;
+      it.printf(0, 42, id(myfont), "Fan: %d   %s", spd,
+                id(auto_demand).state ? "CALL" : "---");
+
+font:
+  - file: "gfonts://Roboto"
+    id: myfont
+    size: 12
+
+interval:
+  # Re-evaluation safety net. Also the retry that releases an anti short-cycle
+  # hold once min_run_seconds / min_off_seconds have elapsed.
+  - interval: 30s
+    then:
+      - script.execute: apply_auto

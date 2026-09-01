@@ -1,0 +1,16 @@
+# Office AirTap vent.
+#
+# Device identity is kept exactly as it was already deployed
+# (airtap-esp32-4btn-1 + MAC suffix 864964) so no HA entity IDs change.
+
+substitutions:
+  name: "airtap-esp32-4btn-1"
+  friendly_name: "AirTap Vent"
+  device_address: "airtap-esp32-4btn-1-864964.local"
+  room_temp_entity: "sensor.temp_sensor_office_temperature"
+  thermostat_entity: "climate.thermy_mcthermostat"
+  default_speed: "4"
+  log_level: "INFO"
+
+packages:
+  vent: !include packages/airtap-vent.yaml

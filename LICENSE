@@ -1,0 +1,13 @@
+This work is licensed under a Creative Commons Attribution-ShareAlike 4.0
+International License (CC BY-SA 4.0).
+
+You can view the license here: https://creativecommons.org/licenses/by-sa/4.0/
+Full legal text: https://creativecommons.org/licenses/by-sa/4.0/legalcode
+
+Copyright (c) 2026 Adam Brown
+
+This is a derivative work. It is based on the ESPHome configuration for the
+AirTap T-Series Gen 2 Rev 1 (4-button) board published by SiloCity Labs at
+https://github.com/SiloCityLabs/esp32-airtap, which is also licensed CC BY-SA 4.0.
+The ShareAlike term of that license is why this repository carries CC BY-SA 4.0
+rather than the MIT license used by the author's earlier Bluetooth integration.
