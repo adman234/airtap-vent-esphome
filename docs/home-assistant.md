@@ -56,7 +56,8 @@ The device imports three things from HA. All of them have to resolve.
   substitution, reporting **°F**.
 - **A thermostat** named in `thermostat_entity`, exposing `target_temp_high` and
   `target_temp_low`.
-- That thermostat reporting **`hvac_action`** (`heating` / `cooling` / `idle`).
+- Optionally, that thermostat reporting **`hvac_action`** (`heating` / `cooling` /
+  `idle`) — only needed if you turn `Require HVAC Active` on. It is off by default.
 
 ### The gotcha worth knowing about
 
@@ -90,9 +91,21 @@ In HA, check in this order:
 4. `binary_sensor.*_auto_fan_demand` tracks what you expect as the room drifts
    off setpoint while the system is running.
 
-If demand is stuck off while the system is actively heating or cooling, turn off
-`switch.*_require_hvac_active` and see if it starts calling. That isolates
-whether your thermostat's `hvac_action` is the thing blocking it.
+If demand is stuck off while the system is actively heating or cooling, work the
+arithmetic rather than guessing. With the fan currently off, cooling demand needs
+**both**:
+
+```
+room > cool_setpoint + room_deadband     (room is far enough past setpoint)
+vent < room - auto_buffer                (the duct air is actually helping)
+```
+
+Read the four numbers off the device page and the thermostat and check them by
+hand. A room sitting exactly on `cool_setpoint + room_deadband` fails, because
+the comparison is strict — drop `Room Deadband` a notch and it will start.
+
+If `Require HVAC Active` is on, also confirm the thermostat reports
+`hvac_action` as `cooling` or `heating`; turning that switch off isolates it.
 
 ## 6. Optional dashboard card
 

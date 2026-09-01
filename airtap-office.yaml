@@ -148,15 +148,15 @@ globals:
   - id: min_run_seconds
     type: int
     restore_value: yes
-    initial_value: '180'       # anti short-cycle: minimum time on
+    initial_value: '30'        # anti short-cycle: minimum time on
   - id: min_off_seconds
     type: int
     restore_value: yes
-    initial_value: '120'       # anti short-cycle: minimum time off
+    initial_value: '30'        # anti short-cycle: minimum time off
   - id: require_hvac_active
     type: bool
     restore_value: yes
-    initial_value: 'true'      # only boost while the thermostat is heating/cooling
+    initial_value: 'false'     # off by default: gate on thermostat hvac_action
   - id: panel_disabled
     type: bool
     restore_value: yes
