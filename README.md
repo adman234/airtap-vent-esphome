@@ -49,15 +49,20 @@ AUTO at 40%.
 ## Layout
 
 ```
-packages/airtap-vent.yaml   # all the logic — shared by every unit
-airtap-office.yaml          # per-device: substitutions + include
-airtap-guest.yaml
+airtap-office.yaml          # complete, self-contained config for one vent
+airtap-guest.yaml           # same, with its own substitutions block
 secrets.yaml.example
 docs/home-assistant.md      # adopting the devices in HA, and what to delete
 ```
 
-Adding another vent is an eight-line file. Copy `airtap-guest.yaml` and change
-`name`, `device_address` and `room_temp_entity`.
+Each device file is standalone — drop it straight into your ESPHome directory,
+no includes or packages needed. Everything below the `substitutions:` block is
+byte-identical between the two files, so adding a vent means copying one and
+editing the top eight lines.
+
+The tradeoff is deliberate: a change to the shared logic has to be applied to
+every device file. If you grow past three or four vents, move the body back into
+`packages/airtap-vent.yaml` and have each device file `!include` it.
 
 ## Getting started
 
