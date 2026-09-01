@@ -26,8 +26,11 @@ room > cool_setpoint  AND  vent < (room - buffer)     -> cooling assist
 room < heat_setpoint  AND  vent > (room + buffer)     -> heating assist
 ```
 
-with hysteresis around the setpoints and minimum run/off times so it does not
-short-cycle.
+The fan starts as soon as the room is the wrong side of its setpoint — the same
+call the thermostat itself just made — and then overruns by `room_deadband`
+before stopping, so it keeps working until the room is genuinely past target
+rather than quitting while still short of it. Minimum run and off times damp any
+remaining chatter.
 
 ### Resting state
 

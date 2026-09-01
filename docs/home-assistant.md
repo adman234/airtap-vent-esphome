@@ -96,13 +96,19 @@ arithmetic rather than guessing. With the fan currently off, cooling demand need
 **both**:
 
 ```
-room > cool_setpoint + room_deadband     (room is far enough past setpoint)
-vent < room - auto_buffer                (the duct air is actually helping)
+room > cool_setpoint          (the room is above target at all)
+vent < room - auto_buffer     (the duct air is actually helping)
 ```
 
 Read the four numbers off the device page and the thermostat and check them by
-hand. A room sitting exactly on `cool_setpoint + room_deadband` fails, because
-the comparison is strict — drop `Room Deadband` a notch and it will start.
+hand. Both comparisons are strict, so a room sitting *exactly* on the setpoint
+does not call — which is correct, since the thermostat is not calling either.
+
+Once running, the first test relaxes to `room > cool_setpoint - room_deadband`,
+so the fan overruns past target rather than stopping short of it. If the vent
+quits while the room still feels warm, the usual cause is the *second* test: the
+compressor cycled off and the duct air warmed to within `auto_buffer` of the
+room, so there is nothing useful left to blow.
 
 If `Require HVAC Active` is on, also confirm the thermostat reports
 `hvac_action` as `cooling` or `heating`; turning that switch off isolates it.

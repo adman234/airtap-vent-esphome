@@ -12,10 +12,13 @@
 #   computed here, so the vent keeps working on its last known inputs if HA
 #   restarts. No HA helpers, template sensors or automations are required.
 #
-#   AUTO demand is true when the HVAC is actively moving air AND boosting this
-#   register would help:
+#   AUTO demand is true when the room is the wrong side of its setpoint AND the
+#   duct air is actually helping:
 #       room > cool_setpoint  AND  vent < (room - buffer)     -> cooling assist
 #       room < heat_setpoint  AND  vent > (room + buffer)     -> heating assist
+#   Once running, the room-vs-setpoint test relaxes by `room_deadband`, so the
+#   fan overruns slightly past the target instead of stopping short of it.
+#   (Optionally also gated on the thermostat's hvac_action -- off by default.)
 #
 # RESTING STATE
 #   Every boot lands in AUTO at ${default_speed}0%. Only a panel button or a
@@ -144,7 +147,7 @@ globals:
   - id: room_deadband
     type: float
     restore_value: yes
-    initial_value: '0.5'       # °F hysteresis around the thermostat setpoints
+    initial_value: '0.5'       # °F to overrun PAST setpoint before stopping
   - id: min_run_seconds
     type: int
     restore_value: yes
@@ -464,12 +467,18 @@ binary_sensor:
         }
       }
 
-      // Hysteresis on the room-vs-setpoint test: harder to start than to keep
-      // running, so the fan does not chatter while the room sits on setpoint.
-      const float margin = id(auto_demand).state ? -id(room_deadband) : id(room_deadband);
+      // Hysteresis on the room-vs-setpoint test, biased toward running. Start as
+      // soon as the room is the wrong side of the setpoint -- the same call the
+      // thermostat itself just made -- then OVERRUN by room_deadband before
+      // stopping, so the fan keeps working until the room is actually past the
+      // target rather than quitting while still short of it.
+      //
+      //   cooling:  start at room > cool_sp,  stop at room <= cool_sp - deadband
+      //   heating:  start at room < heat_sp,  stop at room >= heat_sp + deadband
+      const float overrun = id(auto_demand).state ? id(room_deadband) : 0.0f;
 
-      if (room > cool_sp + margin && vent < (room - buf)) return true;   // cooling assist
-      if (room < heat_sp - margin && vent > (room + buf)) return true;   // heating assist
+      if (room > cool_sp - overrun && vent < (room - buf)) return true;   // cooling assist
+      if (room < heat_sp + overrun && vent > (room + buf)) return true;   // heating assist
       return false;
     on_state:
       then:
