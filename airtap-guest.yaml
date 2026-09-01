@@ -1,16 +1,21 @@
 # Guest room AirTap vent.
 #
-# >>> VERIFY `name` AND `device_address` BEFORE THE FIRST FLASH. <<<
+# Identity confirmed from the unit's own rev-1.4.2 config: node airtap-esp32-4btn-2,
+# friendly name "AirTap Vent Guest", MAC suffix 868f5c.
 #
-# These are INFERRED, not confirmed. Your existing HA entity
-#   sensor.guest_room_airtap_vent_guest_868f5c_vent_temperature
-# decomposes as <area>_<device name>_<entity name>, which puts the device at
-# `airtap-vent-guest` with MAC suffix 868f5c. That is a guess from an entity ID.
+# NOTE ON name_add_mac_suffix
+#   Your rev-1.4.2 guest file sets `name_add_mac_suffix: false`, but its own
+#   comment and its `use_address: airtap-esp32-4btn-2-868f5c.local` both assume
+#   true -- and the live HA entity
+#     sensor.guest_room_airtap_vent_guest_868f5c_vent_temperature
+#   carries the 868f5c suffix, which only happens when it is true. So the running
+#   firmware has it ON and the `false` in that file is an unflashed change.
 #
-# Copy `name` verbatim from the guest unit's current YAML (ESPHome dashboard),
-# and set `device_address` to whatever it answers on RIGHT NOW. Getting `name`
-# wrong renames the device on flash, which changes every entity ID it owns and
-# breaks any dashboard or automation referencing them.
+#   This config keeps it ON, matching the deployed device, so adopting it renames
+#   nothing and every existing entity ID survives. If you actually want the
+#   shorter name, set it to false deliberately -- but expect the device to be
+#   renamed to airtap-esp32-4btn-2, every entity ID it owns to change, and any
+#   dashboard or automation referencing them to break.
 #
 # XIAO ESP32-C6 + SSD1306 OLED + 4 panel buttons + NTC vent probe + PWM fan.
 # Self-contained: drop straight into your ESPHome directory, no includes needed.
@@ -27,9 +32,9 @@
 #       room < heat_setpoint  AND  vent > (room + buffer)     -> heating assist
 #
 # RESTING STATE
-#   Every boot lands in AUTO at ${default_speed}0%. Only a panel button or a
-#   person in HA drops the device to MANUAL. Nothing else does -- see the
-#   `booting` and `auto_applying` guards on the fan triggers.
+#   Every boot lands in AUTO at 40%. Only a panel button or a person in HA drops
+#   the device to MANUAL. Nothing else does -- see the `booting` and
+#   `auto_applying` guards on the fan triggers.
 #
 # UNITS
 #   Everything compared is °F. The NTC calibration is in °C (correct physics) and
@@ -40,9 +45,9 @@
 #   below differs. If you change anything under it, change it in both files.
 
 substitutions:
-  name: "airtap-vent-guest"            # ESPHome node name. Renaming this changes HA entity IDs.
+  name: "airtap-esp32-4btn-2"                        # ESPHome node name. Renaming this changes HA entity IDs.
   friendly_name: "AirTap Vent Guest"
-  device_address: "airtap-vent-guest-868f5c.local"  # Where it answers RIGHT NOW (update after a rename flash).
+  device_address: "airtap-esp32-4btn-2-868f5c.local"  # Where it answers RIGHT NOW (update after a rename flash).
   room_temp_entity: "sensor.temp_sensor_guest_room_temperature"    # Must report °F.
   thermostat_entity: "climate.thermy_mcthermostat"   # Must be in heat_cool mode: needs target_temp_high/low.
   # Resting state: AUTO at this speed (1-10). 4 = 40%.
